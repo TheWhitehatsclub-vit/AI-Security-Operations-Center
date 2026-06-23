@@ -1,0 +1,55 @@
+neuralops/
+│
+├── config/                          # Configuration files
+│   ├── settings.py                  # All config vars (Redis URL, streams, timeouts, API keys)
+│   └── redis.py                     # Async Redis connection pool
+│
+├── shared/                          # Shared across all modules
+│   ├── schema.py                    # Alert & Incident data models (make_alert, make_incident)
+│   └── utils.py                     # UUID generators, timestamp helpers
+│
+├── collectors/                      # INGESTION — 4 ways to push logs to Redis
+│   ├── base.py                      # Base class with Redis emit() function
+│   ├── middleware.py                 # FastAPI middleware — captures every HTTP request
+│   ├── filetail.py                   # Tails nginx access.log and auth.log in real-time
+│   ├── scapy.py                      # Sniffs eth0 network packets (SYN, ARP, DNS)
+│   └── journald.py                   # Reads systemd journal (SSH, sudo, auth events)
+│
+├── engine/                          # DETECTION — core intelligence
+│   ├── rules.py                     # 63 detection rules with regex patterns + MITRE TTPs
+│   ├── parsers.py                   # Log normalization: URL decode, base64 extract, HTML decode
+│   ├── enricher.py                  # GeoIP lookup via MaxMind (IP → country/city/ASN)
+│   ├── matchers.py                  # 6 matcher types: regex, threshold, time_based, correlation, etc.
+│   ├── scorer.py                    # Confidence scoring: rule score + baseline + chain + obfuscation
+│   ├── baseline.py                  # Per-IP behavioral profiling (methods, paths, UA, timing)
+│   ├── correlator.py                # Attack chain detection (recon→exploit→install sequences)
+│   ├── dedup.py                     # Alert dedup by fingerprint with TTL window
+│   ├── feedback.py                  # False positive registry (analyst feedback API)
+│   ├── persistence.py               # Save/load state to Redis every 60s
+│   ├── loader.py                    # Hot-reload rules from Redis every 30s
+│   └── synthetic.py                 # 10 synthetic attack generators for testing
+│
+├── workers/                         # RUNTIME SERVICES
+│   ├── rule_engine.py               # Full production engine (reads Redis → detects → groups incidents)
+│   ├── detect_engine.py             # Simplified continuous engine for live demos (prints alerts)
+│   ├── ml_anomaly.py                # Isolation Forest anomaly detection on request features
+│   ├── threat_intel.py              # AbuseIPDB + GreyNoise + VirusTotal enrichment
+│   └── output.py                    # Writes alerts to file + optional Slack webhook
+│
+├── scripts/                         # HELPER SCRIPTS
+│   ├── demo.py                      # Full pipeline simulation (no Redis, 3 attack scenarios)
+│   ├── demo_xss.py                  # XSS-only demo (no Redis, walks 6 pipeline steps)
+│   ├── demo_server.py               # FastAPI target server on port 8080 (for live attacks)
+│   ├── inject_payload.py            # Interactive: asks payload, pushes to Redis
+│   ├── seed_test_attacks.py         # Injects 10 synthetic attacks into Redis
+│   └── download_geoip.py            # Downloads free MaxMind GeoLite2 databases
+│
+├── tests/                           # TEST SUITE — 16 tests all passing
+│   ├── test_parsers.py              # 4 tests: URL decode, double decode, base64, normalize
+│   ├── test_rules.py                # 4 tests: rule count, structure, TTP format, categories
+│   └── test_scenarios.py            # 8 tests: SQLi, XSS, Log4Shell, PathTraversal, etc.
+│
+├── requirements.txt                 # Python dependencies
+├── run.sh                           # One-command startup
+├── Dockerfile                       # Container build
+└── docker-compose.yml               # Multi-service orchestration

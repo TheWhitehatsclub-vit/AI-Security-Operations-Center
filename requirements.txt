@@ -1,0 +1,9 @@
+redis[hiredis]
+fastapi
+uvicorn[standard]
+scapy
+systemd-python
+scikit-learn
+numpy
+aiohttp
+maxminddb
