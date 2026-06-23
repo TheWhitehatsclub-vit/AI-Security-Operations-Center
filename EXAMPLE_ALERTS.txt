@@ -1,0 +1,136 @@
+======================================================================
+  NEURALOPS — ALERT OUTPUT EXAMPLES
+  Show this to your UI team so they know what to expect
+======================================================================
+
+  Stream: neuralops:alerts
+  Our engine team pushes to this Redis stream. UI team reads from it.
+  Fields are guaranteed stable — we only ADD new ones, never remove.
+
+======================================================================
+  EXAMPLE 1: Brute Force Attack (HIGH)
+======================================================================
+
+  Raw log ingested:
+    POST /login  user=admin&pass=letmein123  → 401 (5 times in 30s)
+    Source: 185.220.101.42 (Germany, Frankfurt)
+
+  Final alert emitted to neuralops:alerts:
+
+  {
+    "id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "timestamp": "2026-06-22T22:15:00Z",
+    "rule_name": "Brute Force Attack",
+    "category": "auth",
+    "severity": "HIGH",
+    "confidence": 0.7200,
+    "confidence_boost": 0.25,
+    "confidence_factors": [
+      ["baseline", 0.05],
+      ["chain", 0.20]
+    ],
+    "ttp": "T1110",
+    "kill_chain": "Exploitation",
+    "source_ip": "185.220.101.42",
+    "matched_value": "5 failed logins in 30s from 185.220.101.42",
+    "matched_pattern": "threshold:auth_brute_force:5:60",
+    "description": "Brute Force Attack detected — 5 failed login attempts in 30 seconds",
+    "incident_id": "",
+    "geo": {
+      "country": "DE",
+      "city": "Frankfurt",
+      "asn": "12345",
+      "isp": "Some Hosting Provider",
+      "is_private": false
+    }
+  }
+
+  What the UI should show:
+    - 🔴 RED card (HIGH severity)
+    - IP badge: 185.220.101.42 with DE flag
+    - Title: "Brute Force Attack — 5 failed logins"
+    - Confidence bar: 0.72 (72%)
+    - Breakdown: baseline +0.05 (abnormal rate), chain +0.20 (previous recon)
+    - Match: threshold rule, 5 attempts in 60s window
+    - Geo: Frankfurt, Germany
+
+======================================================================
+  EXAMPLE 2: Cross-Site Scripting — onmouseover (MEDIUM)
+======================================================================
+
+  Raw log ingested:
+    GET /search?q=<input+onmouseover%3D"alert(1)">
+    Source: 198.51.100.15 (Russia, Moscow)
+
+  Final alert emitted to neuralops:alerts:
+
+  {
+    "id": "f7e8d9c0-b1a2-3344-5566-778899aabbcc",
+    "timestamp": "2026-06-22T22:20:00Z",
+    "rule_name": "XSS",
+    "category": "web",
+    "severity": "MEDIUM",
+    "confidence": 0.4320,
+    "confidence_boost": 0.0,
+    "confidence_factors": [],
+    "ttp": "T1190",
+    "kill_chain": "Exploitation",
+    "source_ip": "198.51.100.15",
+    "matched_value": "onmouseover=\"alert(1)\"",
+    "matched_pattern": "(?i)onmouseover\\s*=\\s*['\"][^'\"]*['\"]",
+    "description": "XSS detected",
+    "incident_id": "",
+    "geo": {
+      "country": "RU",
+      "city": "Moscow",
+      "asn": "34567",
+      "isp": "Some ISP",
+      "is_private": false
+    }
+  }
+
+  What the UI should show:
+    - 🟡 YELLOW card (MEDIUM severity)
+    - IP badge: 198.51.100.15 with RU flag
+    - Title: "XSS — onmouseover=\"alert(1)\""
+    - Confidence bar: 0.432 (43%)
+    - Breakdown: base rule score only (no boost)
+    - Match: regex pattern onmouseover=\s*=['"]...
+    - Geo: Moscow, Russia
+
+======================================================================
+  FIELD REFERENCE
+======================================================================
+
+  Field                Type     Always present   Description
+  ─────────────────────────────────────────────────────────────────────
+  id                   string   yes              UUID v4
+  timestamp            string   yes              ISO 8601 UTC
+  rule_name            string   yes              Rule that fired
+  category             string   yes              web|auth|malware|...
+  severity             string   yes              LOW|MEDIUM|HIGH|CRITICAL
+  confidence           float    yes              0.0 to 1.0
+  confidence_boost     float    yes              Sum of all boosts
+  confidence_factors   array    yes              [["baseline",0.05],...]
+  ttp                  string   yes              MITRE ATT&CK ID
+  kill_chain           string   yes              Recon|Exploit|Install|...
+  source_ip            string   yes              Attacker IP
+  matched_value        string   yes              What the pattern caught
+  matched_pattern      string   yes              The regex/threshold rule
+  description          string   yes              Human-readable summary
+  incident_id          string   yes              "" if solo, "inc-..." if grouped
+  geo                  obj      yes              {country, city, asn, isp}
+  raw_log              obj      no               Original log (may be empty)
+
+======================================================================
+  ENGINE TEAM CONTACT
+======================================================================
+  
+  File: workers/rule_engine.py
+  Rules: engine/rules.py (63 rules)
+  Schema: shared/schema.py
+
+  Questions? Talk to the engine team. We own everything in engine/ and
+  workers/rule_engine.py.
+
+======================================================================
