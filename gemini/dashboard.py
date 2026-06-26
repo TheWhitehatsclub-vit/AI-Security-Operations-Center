@@ -260,6 +260,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .filter-btn.high:hover { border-color: var(--high); color: var(--high); }
   .filter-btn.medium:hover { border-color: var(--medium); color: var(--medium); }
   .filter-btn.low:hover { border-color: var(--low); color: var(--low); }
+  .filter-btn.web:hover { border-color: #5ac8fa; color: #5ac8fa; }
+  .filter-btn.network:hover { border-color: #af52de; color: #af52de; }
+  .filter-btn.system:hover { border-color: #ff9f0a; color: #ff9f0a; }
 
   /* Alert Card */
   .alert-card {
@@ -273,6 +276,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .alert-card.medium { border-left: 2px solid var(--medium); }
   .alert-card.low { border-left: 2px solid var(--low); }
   .alert-card.info { border-left: 2px solid var(--info); }
+  .source-badge { font-size: 9px; font-family: 'JetBrains Mono', monospace; padding: 2px 6px; border-radius: 3px; letter-spacing: 0.06em; text-transform: uppercase; white-space: nowrap; }
+  .source-web { background: rgba(90,200,250,0.12); color: #5ac8fa; border: 0.5px solid rgba(90,200,250,0.2); }
+  .source-network { background: rgba(175,82,222,0.12); color: #af52de; border: 0.5px solid rgba(175,82,222,0.2); }
+  .source-system { background: rgba(255,159,10,0.12); color: #ff9f0a; border: 0.5px solid rgba(255,159,10,0.2); }
 
   .alert-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .alert-rule { font-weight: 600; font-size: 13px; }
@@ -394,6 +401,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <button class="filter-btn high" data-filter="HIGH">High</button>
       <button class="filter-btn medium" data-filter="MEDIUM">Medium</button>
       <button class="filter-btn low" data-filter="LOW">Low</button>
+      <span style="width:1px;height:16px;background:var(--border);margin:0 4px;"></span>
+      <button class="filter-btn web" data-source="web">🌐 Web</button>
+      <button class="filter-btn network" data-source="network">🔌 Network</button>
+      <button class="filter-btn system" data-source="system">⚙️ System</button>
     </div>
     <div id="alertList"></div>
   </div>
@@ -415,6 +426,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 const SEVERITY_CLASS = { CRITICAL: 'critical', HIGH: 'high', MEDIUM: 'medium', LOW: 'low', INFO: 'info' };
 let alerts = [];
 let currentFilter = 'all';
+let currentSource = null;
 let selectedAlertId = null;
 let analysisCache = {};
 
@@ -462,9 +474,12 @@ async function fetchAnalysis() {
 
 function renderAlerts() {
   const container = document.getElementById('alertList');
-  const filtered = currentFilter === 'all'
+  let filtered = currentFilter === 'all'
     ? alerts
     : alerts.filter(a => (a.severity || 'INFO').toUpperCase() === currentFilter);
+  if (currentSource) {
+    filtered = filtered.filter(a => a.source === currentSource);
+  }
 
   if (filtered.length === 0) {
     container.innerHTML = '<div class="empty-state"><div class="empty-icon">📡</div><div class="empty-text">No alerts</div><div class="empty-sub">Waiting for incoming threats...</div></div>';
@@ -477,10 +492,16 @@ function renderAlerts() {
     const isActive = a.id === selectedAlertId;
     const ts = a.timestamp ? new Date(a.timestamp).toLocaleTimeString() : '--';
     const conf = typeof a.confidence === 'number' ? a.confidence.toFixed(3) : a.confidence || '--';
+    const src = a.source || 'web';
+    const srcClass = 'source-' + src;
+    const srcLabel = src === 'network' ? '🔌 NET' : src === 'system' ? '⚙️ SYS' : '🌐 WEB';
     return `<div class="alert-card ${sevClass}${isActive ? ' active' : ''}" data-id="${a.id}" onclick="selectAlert('${a.id}')">
       <div class="alert-header">
         <div class="alert-rule">${a.rule_name || 'Unknown'}</div>
-        <div class="alert-severity severity-${sevClass}">${sev}</div>
+        <div style="display:flex;gap:4px;align-items:center;">
+          <span class="source-badge ${srcClass}">${srcLabel}</span>
+          <div class="alert-severity severity-${sevClass}">${sev}</div>
+        </div>
       </div>
       <div class="alert-body">
         <span class="alert-ip">${a.source_ip || '--'}</span>
@@ -510,9 +531,13 @@ function renderDetail(id) {
   const raw = a.raw_log && typeof a.raw_log === 'object' ? a.raw_log : {};
   const ts = a.timestamp ? new Date(a.timestamp).toISOString().replace('T', ' ').slice(0, 19) : '--';
 
+  const src = a.source || 'web';
+  const srcLabel = src === 'network' ? '🔌 Network' : src === 'system' ? '⚙️ System' : '🌐 Web';
+
   let html = `
     <div class="detail-section">
       <div class="detail-section-title">Alert Details</div>
+      <div class="detail-field"><span class="detail-label">Source</span><span class="detail-value">${srcLabel}</span></div>
       <div class="detail-field"><span class="detail-label">Rule</span><span class="detail-value">${a.rule_name || '--'}</span></div>
       <div class="detail-field"><span class="detail-label">Severity</span><span class="detail-value">${(a.severity || '--').toUpperCase()}</span></div>
       <div class="detail-field"><span class="detail-label">Confidence</span><span class="detail-value mono">${typeof a.confidence === 'number' ? (a.confidence*100).toFixed(1) + '%' : '--'}</span></div>
@@ -578,9 +603,18 @@ function renderDetail(id) {
 document.getElementById('filterBar').addEventListener('click', e => {
   const btn = e.target.closest('.filter-btn');
   if (!btn) return;
-  document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  currentFilter = btn.dataset.filter;
+
+  if (btn.dataset.source) {
+    currentSource = currentSource === btn.dataset.source ? null : btn.dataset.source;
+    document.querySelectorAll('.filter-btn[data-source]').forEach(b => b.classList.remove('active'));
+    if (currentSource) btn.classList.add('active');
+  } else {
+    currentSource = null;
+    document.querySelectorAll('.filter-btn[data-source]').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFilter = btn.dataset.filter;
+  }
   renderAlerts();
 });
 

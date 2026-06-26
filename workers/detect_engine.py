@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
-"""
-NeuralOps — Detection Engine (continuous)
-Run in Terminal 2:  python3 workers/detect_engine.py
-Keeps running, detects every attack until Ctrl+C.
-No timeout errors. Handles Redis disconnects gracefully.
-"""
+# NeuralOps - Detection Engine (continuous)
+# Now reads from all 3 streams: neuralops:logs, neuralops:network, neuralops:system
 
 import sys, os, json, time, uuid, asyncio
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -21,7 +17,7 @@ from engine.rules import get_rules
 
 enricher = get_enricher()
 
-def process_one(raw: dict) -> dict | None:
+def process_one(raw: dict, source_label: str = "web") -> dict | None:
     norm = normalize_log(raw)
     enricher.enrich(norm)
     baseline.observe(norm)
@@ -55,6 +51,7 @@ def process_one(raw: dict) -> dict | None:
                 "incident_id": "",
                 "geo": norm.get("geo", {}),
                 "raw_log": raw,
+                "source": source_label,
             }
             best_ci = ci
             best_rule = rule
@@ -70,14 +67,32 @@ async def get_connection():
         socket_timeout=None,
     )
 
+STREAM_NAMES = {
+    STREAMS["logs"]: "logs",
+    STREAMS["network"]: "network",
+    STREAMS["system"]: "system",
+}
+
+STREAM_LABELS = {
+    "logs": "web",
+    "network": "network",
+    "system": "system",
+}
+
+STREAM_DISPLAY = {
+    "logs": "LOG",
+    "network": "NET",
+    "system": "SYS",
+}
+
 async def main():
     print("=" * 60, flush=True)
-    print("  NEURALOPS — Detection Engine (continuous)", flush=True)
-    print("  Waiting for attacks on neuralops:logs ...", flush=True)
+    print("  NEURALOPS — Detection Engine (multi-stream)", flush=True)
+    print("  Watching: web-logs | network | system", flush=True)
     print("  Press Ctrl+C to stop", flush=True)
     print("=" * 60, flush=True)
 
-    last_id = "0"
+    last_ids = {STREAMS["logs"]: "0", STREAMS["network"]: "0", STREAMS["system"]: "0"}
     r = None
 
     try:
@@ -86,8 +101,8 @@ async def main():
         while True:
             try:
                 result = await r.xread(
-                    {STREAMS["logs"]: last_id},
-                    count=1,
+                    {k: v for k, v in last_ids.items()},
+                    count=5,
                     block=2000,
                 )
             except (ConnectionError, OSError, aioredis.TimeoutError) as e:
@@ -104,42 +119,43 @@ async def main():
             if not result:
                 continue
 
-            _, entries = result[0]
-            for eid, data in entries:
-                last_id = eid
-                raw = dict(data)
+            for stream_name, entries in result:
+                stream_key = STREAM_NAMES.get(stream_name, "logs")
+                source_label = STREAM_LABELS.get(stream_key, "web")
+                display = STREAM_DISPLAY.get(stream_key, "LOG")
 
-                try:
-                    await r.xdel(STREAMS["logs"], eid)
-                except Exception:
-                    pass
+                for eid, data in entries:
+                    last_ids[stream_name] = eid
+                    raw = dict(data)
 
-                print(f"\n{'='*60}", flush=True)
-                print(f"  LOG — {raw.get('method','')} {raw.get('path','') or raw.get('url','')} from {raw.get('source_ip','?')}", flush=True)
-                print(f"{'='*60}", flush=True)
-
-                alert = process_one(raw)
-
-                if alert:
                     try:
-                        flat = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in alert.items()}
-                        await r.xadd(STREAMS["alerts"], flat, maxlen=20000)
+                        await r.xdel(stream_name, eid)
                     except Exception:
                         pass
 
-                    print(f"\n  ► ALERT: {alert['rule_name']} — conf={alert['confidence']:.3f} [{alert['severity']}]", flush=True)
-                    print(f"    Matched: {alert['matched_value'][:80]}", flush=True)
-                    print(f"    Factors: {alert['confidence_factors']}", flush=True)
-                    print(f"    ID: {alert['id']}", flush=True)
-                    print(f"    TTP: {alert['ttp']}  Kill Chain: {alert['kill_chain']}", flush=True)
-                    print(f"    IP: {alert['source_ip']}", flush=True)
-                    print(f"    Geo: {json.dumps(alert['geo'], indent=4)}", flush=True)
-                    print(f"\n    ── Raw Log ──", flush=True)
-                    print(f"{json.dumps(alert['raw_log'], indent=4)}", flush=True)
-                    print(f"\n    ── Full Alert JSON ──", flush=True)
-                    print(f"{json.dumps(alert, indent=4)}", flush=True)
-                else:
-                    print(f"  (below threshold)", flush=True)
+                    ip = raw.get("source_ip") or raw.get("src_ip") or raw.get("hostname") or "?"
+                    method = raw.get("method") or raw.get("protocol") or raw.get("unit") or ""
+                    path = raw.get("path") or raw.get("dst_ip") or raw.get("message", "")[:60]
+
+                    print(f"\n{'='*60}", flush=True)
+                    print(f"  [{display}] {method} {path} from {ip}", flush=True)
+                    print(f"{'='*60}", flush=True)
+
+                    alert = process_one(raw, source_label)
+
+                    if alert:
+                        try:
+                            flat = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in alert.items()}
+                            await r.xadd(STREAMS["alerts"], flat, maxlen=20000)
+                        except Exception:
+                            pass
+
+                        print(f"\n  ► ALERT: {alert['rule_name']} — conf={alert['confidence']:.3f} [{alert['severity']}]", flush=True)
+                        print(f"    Source: {alert['source']}  IP: {alert['source_ip']}", flush=True)
+                        print(f"    Matched: {alert['matched_value'][:80]}", flush=True)
+                        print(f"    TTP: {alert['ttp']}  Kill Chain: {alert['kill_chain']}", flush=True)
+                    else:
+                        print(f"  (below threshold)", flush=True)
 
     except asyncio.CancelledError:
         pass
