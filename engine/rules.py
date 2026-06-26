@@ -1127,6 +1127,45 @@ RULES = [
         ],
         "fields": ["url"],
     },
+    # System Authentication Failures
+    {
+        "id": "SYS-001",
+        "name": "Authentication Failure",
+        "category": "auth",
+        "type": "regex",
+        "patterns": [r"(?i)(Failed password|incorrect password|authentication failure|auth could not identify|conversation failed)"],
+        "fields": ["message", "raw", "query", "body"],
+        "severity": "MEDIUM",
+        "base_score": 50,
+        "ttps": ["T1110"],
+        "kill_chain": "Exploitation",
+    },
+    # Reverse Shell (system-level)
+    {
+        "id": "SYS-002",
+        "name": "Reverse Shell",
+        "category": "malware",
+        "type": "regex",
+        "patterns": [r"(?i)(bash.*(?:/dev/tcp|/dev/udp)|nc\s+-e\s+/bin|ncat|socat|mkfifo|python\s+-c\s+.*socket)"],
+        "fields": ["message", "body", "query"],
+        "severity": "HIGH",
+        "base_score": 80,
+        "ttps": ["T1059"],
+        "kill_chain": "Execution",
+    },
+    # Sudo abuse
+    {
+        "id": "SYS-003",
+        "name": "Sudo Privilege Escalation",
+        "category": "auth",
+        "type": "regex",
+        "patterns": [r"(?i)(sudo\b.*COMMAND=|sudo\b.*authentication failure|pam_unix.*sudo)"],
+        "fields": ["message", "raw"],
+        "severity": "HIGH",
+        "base_score": 60,
+        "ttps": ["T1068"],
+        "kill_chain": "Privilege Escalation",
+    },
 ]
 
 def get_rules() -> list[dict]:
