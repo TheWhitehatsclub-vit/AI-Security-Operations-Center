@@ -6,4 +6,5 @@ systemd-python
 scikit-learn
 numpy
 aiohttp
+httpx
 maxminddb
