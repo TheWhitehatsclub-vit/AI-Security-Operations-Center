@@ -711,7 +711,7 @@ RULES = [
             r"(?i)\.(?:php|phtml|php5|jsp|jspx|asp|aspx|war|cgi|py|pl|sh|ps1)\s*$",
             r"(?i)Content-Type:\s*application/x-php",
             r"(?i)Content-Type:\s*application/x-java",
-            r"(?i)r57|c99|b374k|wso|webshell|cmd\.asp",
+            r"(?i)\br57\b|\bc99(?:shell|\.php)?\b|b374k|wso|webshell|cmd\.asp",
             r"(?i)shell\.php|eval\.php|cmd\.php|upload\.php",
             r"(?i)Content-Disposition.*filename=.*\.(?:php|jsp|asp|aspx|war|cgi)",
         ],
