@@ -561,13 +561,28 @@ function renderDetail(id) {
       <div class="detail-field"><span class="detail-label">Matched</span><span class="detail-value mono" style="font-size:10px;">${(a.matched_value || '').slice(0,60)}</span></div>
     </div>
 
+    ${src === 'web' ? `
     <div class="detail-section">
       <div class="detail-section-title">Request Context</div>
       <div class="detail-field"><span class="detail-label">Method</span><span class="detail-value mono">${raw.method || '--'}</span></div>
       <div class="detail-field"><span class="detail-label">Path</span><span class="detail-value mono">${raw.path || '--'}</span></div>
       <div class="detail-field"><span class="detail-label">Status</span><span class="detail-value mono">${raw.status || '--'}</span></div>
       <div class="detail-field"><span class="detail-label">User Agent</span><span class="detail-value mono" style="font-size:10px;">${(raw.user_agent || '--').slice(0,40)}</span></div>
-    </div>
+    </div>` : src === 'network' ? `
+    <div class="detail-section">
+      <div class="detail-section-title">Network Context</div>
+      <div class="detail-field"><span class="detail-label">Tool</span><span class="detail-value mono">${raw.tool || a.tool || '--'}</span></div>
+      <div class="detail-field"><span class="detail-label">Scan Type</span><span class="detail-value mono">${raw.scan_type || '--'}</span></div>
+      <div class="detail-field"><span class="detail-label">Dst IP</span><span class="detail-value mono">${raw.dst_ip || '--'}</span></div>
+      <div class="detail-field"><span class="detail-label">Dst Port</span><span class="detail-value mono">${raw.dst_port || '--'}</span></div>
+      <div class="detail-field"><span class="detail-label">State</span><span class="detail-value mono">${raw.state || '--'}</span></div>
+    </div>` : src === 'system' ? `
+    <div class="detail-section">
+      <div class="detail-section-title">System Context</div>
+      <div class="detail-field"><span class="detail-label">Message</span><span class="detail-value mono" style="font-size:10px;">${(raw.message || a.matched_value || '').slice(0,80)}</span></div>
+      <div class="detail-field"><span class="detail-label">Unit</span><span class="detail-value mono">${raw.unit || raw._SYSTEMD_UNIT || '--'}</span></div>
+      <div class="detail-field"><span class="detail-label">Hostname</span><span class="detail-value mono">${raw.hostname || raw._HOSTNAME || '--'}</span></div>
+    </div>` : ''}
 
     ${geo.country || geo.city ? `
     <div class="detail-section">

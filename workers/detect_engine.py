@@ -94,7 +94,7 @@ async def main():
     print("=" * 60, flush=True)
 
     last_ids = {STREAMS["logs"]: "$", STREAMS["network"]: "$", STREAMS["system"]: "$"}
-    local_dedup = DedupEngine(window=60)
+    local_dedup = DedupEngine(window=30)
     r = None
 
     try:
@@ -166,7 +166,7 @@ async def main():
                             if already:
                                 print(f"  (dedup(redis): {alert['rule_name']} from {alert['source_ip']} already fired)", flush=True)
                                 continue
-                            await r.set(dedup_key, "1", ex=60)
+                            await r.set(dedup_key, "1", ex=30)
                         except Exception as e:
                             print(f"  [warning] Redis dedup check failed: {e}", flush=True)
                         try:
