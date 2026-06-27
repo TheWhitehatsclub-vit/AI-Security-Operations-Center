@@ -8,3 +8,5 @@ numpy
 aiohttp
 httpx
 maxminddb
+pytest
+pytest-asyncio

@@ -5,7 +5,7 @@ Uses journalctl -f to stream logs (more reliable than systemd Python module).
 Run:  sudo PYTHONPATH=. python3 collectors/journald.py
 """
 
-import sys, os, json, uuid, time, subprocess, re
+import sys, os, json, uuid, time, subprocess, re, threading
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import redis
@@ -13,6 +13,7 @@ import redis
 r = redis.Redis.from_url("redis://localhost:6379/0", decode_responses=True)
 
 STREAM = "neuralops:system"
+HEARTBEAT_KEY = "neuralops:heartbeat:journald"
 
 KEYWORDS = re.compile(
     r"(Failed password|Accepted password|authentication failure|"
@@ -23,6 +24,16 @@ KEYWORDS = re.compile(
     r"ncorrect password|unknown user|refused|"
     r"permission denied|authorized)", re.I
 )
+
+def heartbeat_loop():
+    while True:
+        try:
+            r.setex(HEARTBEAT_KEY, 30, json.dumps({"pid": os.getpid(), "time": time.time()}))
+        except Exception:
+            pass
+        time.sleep(15)
+
+threading.Thread(target=heartbeat_loop, daemon=True).start()
 
 print("=" * 60)
 print("  NEURALOPS — Real System Log Collector")

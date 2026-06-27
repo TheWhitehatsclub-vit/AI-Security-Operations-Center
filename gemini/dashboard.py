@@ -17,12 +17,26 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from config.settings import REDIS_URL, STREAMS
+from engine.feedback import feedback_engine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("neuralops.dashboard")
 
 app = FastAPI(title="NeuralOps — SOC Dashboard")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ── Optional API key auth ──
+DASHBOARD_API_KEY = os.environ.get("DASHBOARD_API_KEY")
+if DASHBOARD_API_KEY:
+    logger.info("Dashboard API auth enabled (set DASHBOARD_API_KEY env var)")
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    if DASHBOARD_API_KEY and request.url.path.startswith("/api/"):
+        key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+        if key != DASHBOARD_API_KEY:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
 
 ALERT_STREAM = STREAMS["alerts"]
 ANALYSIS_STREAM = "neuralops:gemini_analysis"
@@ -113,6 +127,27 @@ async def get_alert(alert_id: str):
                         try: alert[field] = json.loads(alert[field])
                         except: pass
                 return alert
+        return JSONResponse({"error": "not found"}, status_code=404)
+    finally:
+        await r.aclose()
+
+@app.post("/api/alerts/{alert_id}/fp")
+async def mark_false_positive(alert_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    r = await get_redis()
+    try:
+        alerts = await r.xrevrange(ALERT_STREAM, count=1000)
+        for eid, data in alerts:
+            if data.get("id") == alert_id:
+                alert = dict(data)
+                for field in ("confidence", "confidence_boost"):
+                    try: alert[field] = float(alert.get(field, 0))
+                    except: pass
+                await feedback_engine.mark_false_positive(alert, reason=body.get("reason", ""))
+                return {"status": "ok", "message": "Marked as false positive"}
         return JSONResponse({"error": "not found"}, status_code=404)
     finally:
         await r.aclose()
@@ -533,6 +568,17 @@ function selectAlert(id) {
   renderDetail(id);
 }
 
+async function markFP(id) {
+  try {
+    const r = await fetch('/api/alerts/' + id + '/fp', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({reason:'analyst feedback'})});
+    if (r.ok) {
+      document.getElementById('detailContent').innerHTML = '<div style="padding:40px;text-align:center;"><div style="font-size:14px;color:#34c759;">✓ Marked as False Positive</div><div style="font-size:11px;color:var(--text-tertiary);margin-top:8px;">This alert will be suppressed in the future.</div></div>';
+      alerts = alerts.filter(x => x.id !== id);
+      renderAlerts();
+    }
+  } catch(e) {}
+}
+
 function renderDetail(id) {
   const a = alerts.find(x => x.id === id);
   const container = document.getElementById('detailContent');
@@ -622,6 +668,10 @@ function renderDetail(id) {
       <div style="font-size:11px;color:var(--text-tertiary);">⏳ Waiting for Gemini analysis...</div>
     </div>`;
   }
+
+  html += `<div style="margin-top:16px;display:flex;gap:8px;">
+    <button onclick="markFP('${a.id}')" style="flex:1;padding:6px;font-size:10px;font-family:'JetBrains Mono',monospace;border:0.5px solid rgba(255,59,48,0.3);border-radius:4px;background:rgba(255,59,48,0.08);color:#ff3b30;cursor:pointer;text-transform:uppercase;letter-spacing:0.06em;">✕ Mark False Positive</button>
+  </div>`;
 
   container.innerHTML = html;
 }

@@ -1,6 +1,6 @@
+import asyncio, uuid, time
 from collectors.base import BaseCollector
 from fastapi import FastAPI, Request
-import uuid, time
 
 app = FastAPI()
 
@@ -8,6 +8,17 @@ class MiddlewareCollector(BaseCollector):
     name = "logs"
 
 middleware_collector = MiddlewareCollector()
+
+@app.on_event("startup")
+async def start_heartbeat():
+    async def heart():
+        while True:
+            try:
+                await middleware_collector.heartbeat()
+            except Exception:
+                pass
+            await asyncio.sleep(15)
+    asyncio.create_task(heart())
 
 @app.middleware("http")
 async def log_middleware(request: Request, call_next):

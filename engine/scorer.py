@@ -1,8 +1,8 @@
 from engine.baseline import baseline
 from engine.correlator import get_correlator
 
-def compute_confidence(rule_score: float, rule: dict, log_norm: dict) -> dict:
-    base = rule.get("base_score", 50) / 100.0
+def compute_confidence(rule_score: float, rule: dict, log_norm: dict, fp_adjustment: float = 1.0) -> dict:
+    base = (rule.get("base_score", 50) / 100.0) * fp_adjustment
     if rule_score <= 0:
         return {"score": 0.0, "severity": "INFO", "boost": 0.0}
 

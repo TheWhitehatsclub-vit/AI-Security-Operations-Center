@@ -72,7 +72,6 @@ class ScapyCollector(BaseCollector):
     def __init__(self):
         super().__init__()
         self.prev_set = set()
-        self.prev_pids = set()
         self.scan_reported_procs = {}
         self.scan_reported_ips = {}
 
@@ -95,33 +94,25 @@ class ScapyCollector(BaseCollector):
 
     async def detect_scan_tools(self):
         try:
-            current = {n for n in os.listdir("/proc") if n.isdigit()}
+            pids = os.listdir("/proc")
         except Exception:
             return False
 
         found = False
-        seen = set()
         now = time.time()
-        for pid in current:
-            if pid in self.prev_pids:
-                seen.add(pid)
+        for name in pids:
+            if not name.isdigit():
                 continue
-            try:
-                seen.add(pid)
-            except Exception:
-                continue
-
-            tool = await self._identify_proc(pid)
+            tool = await self._identify_proc(name)
             if tool is None:
                 continue
             last = self.scan_reported_procs.get(tool, 0)
             if now - last >= 60:
                 self.scan_reported_procs[tool] = now
-                entry = self._mk("proc_monitor", "scan_tool_detected", tool=tool)
+                entry = self._mk("proc_monitor", "scan_tool_detected", tool=tool, src_ip="127.0.0.1")
                 await self.emit(entry)
                 found = True
 
-        self.prev_pids = seen
         return found
 
     async def _identify_proc(self, pid):
@@ -299,10 +290,13 @@ class ScapyCollector(BaseCollector):
     # ── Run Loop ──────────────────────────────────────────────────
 
     async def run(self):
-        try:
-            self.prev_pids = {n for n in os.listdir("/proc") if n.isdigit()}
-        except Exception:
-            pass
+        async def heart():
+            while True:
+                try:
+                    await self.heartbeat()
+                except Exception:
+                    pass
+                await asyncio.sleep(15)
 
         async def fast_watcher():
             while True:
@@ -328,7 +322,7 @@ class ScapyCollector(BaseCollector):
                     pass
                 await asyncio.sleep(1.0)
 
-        await asyncio.gather(fast_watcher(), tcp_poller(), arp_poller())
+        await asyncio.gather(heart(), fast_watcher(), tcp_poller(), arp_poller())
 
 
 async def main():
