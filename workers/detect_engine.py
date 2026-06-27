@@ -14,6 +14,7 @@ from engine.matchers import match_rule
 from engine.scorer import compute_confidence
 from engine.baseline import baseline
 from engine.rules import get_rules
+from engine.dedup import DedupEngine
 
 enricher = get_enricher()
 
@@ -92,11 +93,22 @@ async def main():
     print("  Press Ctrl+C to stop", flush=True)
     print("=" * 60, flush=True)
 
-    last_ids = {STREAMS["logs"]: "0", STREAMS["network"]: "0", STREAMS["system"]: "0"}
+    last_ids = {STREAMS["logs"]: "$", STREAMS["network"]: "$", STREAMS["system"]: "$"}
+    local_dedup = DedupEngine(window=60)
     r = None
 
     try:
         r = await get_connection()
+
+        # Drain any existing entries from all 3 streams so we only process NEW events
+        for sname in [STREAMS["logs"], STREAMS["network"], STREAMS["system"]]:
+            try:
+                last = await r.xrevrange(sname, count=1)
+                if last:
+                    last_ids[sname] = last[0][0]
+                    print(f"  [drain] {sname} — skipping {last[0][0]} entries", flush=True)
+            except Exception:
+                pass
 
         while True:
             try:
@@ -144,6 +156,19 @@ async def main():
                     alert = process_one(raw, source_label)
 
                     if alert:
+                        # Two-layer dedup: 1) local in-memory fingerprint, 2) Redis cross-process fence
+                        if local_dedup.is_duplicate(alert):
+                            print(f"  (dedup: {alert['rule_name']} from {alert['source_ip']} — already fired, skipping)", flush=True)
+                            continue
+                        dedup_key = f"dedup:{alert['rule_name']}:{alert['source_ip']}"
+                        try:
+                            already = await r.get(dedup_key)
+                            if already:
+                                print(f"  (dedup(redis): {alert['rule_name']} from {alert['source_ip']} already fired)", flush=True)
+                                continue
+                            await r.set(dedup_key, "1", ex=60)
+                        except Exception as e:
+                            print(f"  [warning] Redis dedup check failed: {e}", flush=True)
                         try:
                             flat = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in alert.items()}
                             await r.xadd(STREAMS["alerts"], flat, maxlen=20000)

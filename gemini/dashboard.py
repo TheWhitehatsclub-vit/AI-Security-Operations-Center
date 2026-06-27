@@ -68,6 +68,10 @@ async def get_alerts(limit: int = Query(50, le=200), severity: Optional[str] = N
             for field in ("confidence", "confidence_boost"):
                 try: alert[field] = float(alert.get(field, 0))
                 except: alert[field] = 0.0
+            for field in ("raw_log", "geo"):
+                if isinstance(alert.get(field), str):
+                    try: alert[field] = json.loads(alert[field])
+                    except: pass
             if severity and alert.get("severity", "").upper() != severity.upper():
                 continue
             if rule and rule.lower() not in alert.get("rule_name", "").lower():
@@ -104,6 +108,10 @@ async def get_alert(alert_id: str):
                 alert = dict(data)
                 try: alert["confidence"] = float(alert.get("confidence", 0))
                 except: pass
+                for field in ("raw_log", "geo"):
+                    if isinstance(alert.get(field), str):
+                        try: alert[field] = json.loads(alert[field])
+                        except: pass
                 return alert
         return JSONResponse({"error": "not found"}, status_code=404)
     finally:
@@ -134,6 +142,10 @@ async def stream_events(request: Request):
                             for field in ("confidence", "confidence_boost"):
                                 try: alert[field] = float(alert.get(field, 0))
                                 except: alert[field] = 0.0
+                            for field in ("raw_log", "geo"):
+                                if isinstance(alert.get(field), str):
+                                    try: alert[field] = json.loads(alert[field])
+                                    except: pass
                             yield f"data: {json.dumps({'type': 'alert', 'data': alert})}\n\n"
                 yield f"data: {json.dumps({'type': 'ping'})}\n\n"
         finally:

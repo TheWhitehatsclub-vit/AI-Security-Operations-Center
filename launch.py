@@ -141,8 +141,8 @@ def main():
         ("2", "engine", "Detection Engine (required)"),
         ("3", "dashboard", "SOC Dashboard (port 8002)"),
         ("4", "gemini", "Gemini Analyzer (needs GEMINI_API_KEY)"),
-        ("5", "journald", "System Log Collector (journald, needs sudo)"),
-        ("6", "scapy", "Network Sniffer (scapy, needs sudo)"),
+        ("5", "journald", "System Log Collector (journald)"),
+        ("6", "scapy", "Network Monitor (connections)"),
     ]
     for key, _, desc in options:
         print(f"    [{key}] {desc}")

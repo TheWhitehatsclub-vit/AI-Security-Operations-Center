@@ -30,20 +30,45 @@ ANALYSIS_STREAM = "neuralops:gemini_analysis"
 def build_prompt(alert: dict) -> str:
     raw = alert.get("raw_log", {})
     geo = alert.get("geo", {})
+    source = alert.get("source", "web")
 
     decoded_query = unquote_plus(raw.get("query", "")) if raw.get("query") else ""
-    matched_value = alert.get("matched_value", "")
-    matched_pattern = alert.get("matched_pattern", "")
 
-    pattern_mismatch = (
-        "onmouseover" in matched_value or
-        "onerror" in matched_value or
-        "onclick" in matched_value
-    ) and "<script" in matched_pattern.lower()
+    # Build context section based on source type
+    if source == "network":
+        context = f"""Source IP      : {raw.get("src_ip", raw.get("source_ip", ""))}
+Destination IP : {raw.get("dst_ip", "")}
+Destination Port : {raw.get("dst_port", "")}
+State          : {raw.get("state", "")}
+Alert Type     : {raw.get("alert_type", "")}
+Tool           : {raw.get("tool", "")}
+Scan Type      : {raw.get("scan_type", "")}
+Port Count     : {raw.get("port_count", "")}
+SYN Count      : {raw.get("syn_count", "")}
+EST Count      : {raw.get("est_count", "")}
+SYN/EST Ratio  : {raw.get("ratio", "")}
+Detail         : {raw.get("detail", "")}
+IP             : {raw.get("ip", "")}
+MAC            : {raw.get("mac", "")}
+Previous MAC   : {raw.get("previous_mac", "")}
+Current MAC    : {raw.get("current_mac", "")}"""
+    elif source == "system":
+        context = f"""Message        : {raw.get("message", "")}
+Unit           : {raw.get("unit", "")}
+Hostname       : {raw.get("hostname", "")}
+Source IP      : {raw.get("source_ip", raw.get("src_ip", ""))}"""
+    else:
+        context = f"""Source IP      : {raw.get("source_ip", "")}
+Method         : {raw.get("method", "")}
+Path           : {raw.get("path", "")}
+Decoded Query  : {decoded_query}
+User-Agent     : {raw.get("user_agent", "")}
+Status         : {raw.get("status", "")}
+Body           : {(raw.get("body") or "")[:300]}"""
 
     return f"""
 You are an expert AI SOC analyst working inside NeuralOps.
-Analyze the following web attack alert and provide structured triage.
+Analyze the following {source} security alert and provide structured triage.
 
 ALERT METADATA
 Alert ID       : {alert.get("id","")}
@@ -52,20 +77,17 @@ Rule           : {alert.get("rule_name","")}
 Category       : {alert.get("category","")}
 Severity       : {alert.get("severity","")}
 Confidence     : {alert.get("confidence",0):.3f}
+Confidence Boost : {alert.get("confidence_boost",0)}
 TTP            : {alert.get("ttp","")}
 Kill Chain     : {alert.get("kill_chain","")}
 
 DETECTION DETAILS
-Matched Value  : {matched_value}
-Matched Pattern: {matched_pattern}
+Matched Value  : {alert.get("matched_value","")}
+Matched Pattern: {alert.get("matched_pattern","")}
 Description    : {alert.get("description","")}
 
 REQUEST CONTEXT
-Source IP      : {raw.get("source_ip","")}
-Method         : {raw.get("method","")}
-Path           : {raw.get("path","")}
-Decoded Query  : {decoded_query}
-User-Agent     : {raw.get("user_agent","")}
+{context}
 
 GEO CONTEXT
 Country        : {geo.get("country","Unknown")}
