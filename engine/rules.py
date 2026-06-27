@@ -907,7 +907,7 @@ RULES = [
         "kill_chain": "Actions on Objectives",
         "base_score": 55,
         "patterns": [
-            r"(?i)[A-Za-z0-9+/]{100,}={0,2}",
+            r"(?i)[A-Za-z0-9+/]{30,}={0,2}",
         ],
         "fields": ["query", "url"],
     },
@@ -940,7 +940,7 @@ RULES = [
         "base_score": 100,
         "patterns": [
             r"(?i)AIza[0-9A-Za-z\-_]{35}",
-            r"(?i)sk-[a-zA-Z0-9]{32,}",
+            r"(?i)sk-[a-zA-Z0-9_\-]{12,}",
             r"(?i)xox[bp]-[a-zA-Z0-9]{10,}",
             r"(?i)ghp_[a-zA-Z0-9]{36}",
             r"(?i)AKIA[0-9A-Z]{16}",

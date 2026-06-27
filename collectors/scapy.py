@@ -283,7 +283,7 @@ class ScapyCollector(BaseCollector):
 
     async def _emit_scan(self, ip, ports, scan_type):
         entry = self._mk("tcp_monitor", "port_scan_detected",
-                         src_ip=ip, scanned_ports=ports[:50],
+                         src_ip=ip, scanned_ports=",".join(str(p) for p in ports[:50]),
                          port_count=len(ports),
                          window_seconds=SCAN_WINDOW_SECS,
                          scan_type=scan_type)

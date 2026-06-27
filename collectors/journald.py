@@ -31,7 +31,7 @@ print("  Press Ctrl+C to stop")
 print("=" * 60)
 print()
 
-cmd = ["journalctl", "-f", "-o", "cat", "--no-tail"]
+cmd = ["journalctl", "-f", "-o", "cat", "-n", "0"]
 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
 
 count = 0
