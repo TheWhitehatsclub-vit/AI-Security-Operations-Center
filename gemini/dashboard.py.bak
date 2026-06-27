@@ -1,0 +1,708 @@
+"""
+NeuralOps — SOC Dashboard Server
+Real-time dashboard backend serving alerts + Gemini analysis via REST + SSE.
+"""
+
+import sys, os, json, asyncio, logging
+from datetime import datetime
+from typing import Optional
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+import redis.asyncio as aioredis
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+from config.settings import REDIS_URL, STREAMS
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("neuralops.dashboard")
+
+app = FastAPI(title="NeuralOps — SOC Dashboard")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+ALERT_STREAM = STREAMS["alerts"]
+ANALYSIS_STREAM = "neuralops:gemini_analysis"
+
+async def get_redis():
+    return aioredis.from_url(REDIS_URL, decode_responses=True)
+
+# ── API ──────────────────────────────────────────────────────────────────────
+
+@app.get("/api/stats")
+async def stats():
+    r = await get_redis()
+    try:
+        total = await r.xlen(ALERT_STREAM)
+        analyzed = await r.xlen(ANALYSIS_STREAM)
+        alerts = await r.xrevrange(ALERT_STREAM, count=100)
+        severity_count = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
+        category_count = {}
+        for _, data in alerts:
+            sev = data.get("severity", "INFO").upper()
+            cat = data.get("category", "unknown")
+            if sev in severity_count:
+                severity_count[sev] += 1
+            category_count[cat] = category_count.get(cat, 0) + 1
+        return {
+            "total_alerts": total,
+            "total_analyzed": analyzed,
+            "by_severity": severity_count,
+            "by_category": category_count
+        }
+    finally:
+        await r.aclose()
+
+@app.get("/api/alerts")
+async def get_alerts(limit: int = Query(50, le=200), severity: Optional[str] = None, rule: Optional[str] = None):
+    r = await get_redis()
+    try:
+        alerts = await r.xrevrange(ALERT_STREAM, count=limit)
+        result = []
+        for eid, data in alerts:
+            alert = dict(data)
+            alert["_id"] = eid
+            for field in ("confidence", "confidence_boost"):
+                try: alert[field] = float(alert.get(field, 0))
+                except: alert[field] = 0.0
+            # Parse raw_log from JSON string to object
+            try: alert["raw_log"] = json.loads(alert.get("raw_log", "{}"))
+            except: alert["raw_log"] = {}
+            # Parse geo from JSON string to object
+            try: alert["geo"] = json.loads(alert.get("geo", "{}"))
+            except: alert["geo"] = {}
+            if severity and alert.get("severity", "").upper() != severity.upper():
+                continue
+            if rule and rule.lower() not in alert.get("rule_name", "").lower():
+                continue
+            result.append(alert)
+        return {"alerts": result, "total": len(result)}
+    finally:
+        await r.aclose()
+
+@app.get("/api/analysis")
+async def get_analysis(limit: int = Query(50, le=200)):
+    r = await get_redis()
+    try:
+        items = await r.xrevrange(ANALYSIS_STREAM, count=limit)
+        result = []
+        for eid, data in items:
+            item = dict(data)
+            item["_id"] = eid
+            for field in ("analysis",):
+                try: item[field] = json.loads(item.get(field, "{}"))
+                except: item[field] = {}
+            result.append(item)
+        return {"analysis": result, "total": len(result)}
+    finally:
+        await r.aclose()
+
+@app.get("/api/alerts/{alert_id}")
+async def get_alert(alert_id: str):
+    r = await get_redis()
+    try:
+        alerts = await r.xrevrange(ALERT_STREAM, count=1000)
+        for eid, data in alerts:
+            if data.get("id") == alert_id:
+                alert = dict(data)
+                try: alert["confidence"] = float(alert.get("confidence", 0))
+                except: pass
+                try: alert["raw_log"] = json.loads(alert.get("raw_log", "{}"))
+                except: alert["raw_log"] = {}
+                try: alert["geo"] = json.loads(alert.get("geo", "{}"))
+                except: alert["geo"] = {}
+                return alert
+        return JSONResponse({"error": "not found"}, status_code=404)
+    finally:
+        await r.aclose()
+
+# ── SSE Real-time Stream ─────────────────────────────────────────────────────
+
+@app.get("/api/stream")
+async def stream_events(request: Request):
+    async def event_generator():
+        r = await get_redis()
+        last_id = "$"
+        try:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    result = await r.xread({ALERT_STREAM: last_id}, count=5, block=5000)
+                except Exception:
+                    await asyncio.sleep(1)
+                    continue
+
+                if result:
+                    last_id = result[0][1][-1][0]
+                    for _, entries in result:
+                        for eid, data in entries:
+                            alert = dict(data)
+                            for field in ("confidence", "confidence_boost"):
+                                try: alert[field] = float(alert.get(field, 0))
+                                except: alert[field] = 0.0
+                            try: alert["raw_log"] = json.loads(alert.get("raw_log", "{}"))
+                            except: alert["raw_log"] = {}
+                            try: alert["geo"] = json.loads(alert.get("geo", "{}"))
+                            except: alert["geo"] = {}
+                            yield f"data: {json.dumps({'type': 'alert', 'data': alert})}\n\n"
+                yield f"data: {json.dumps({'type': 'ping'})}\n\n"
+        finally:
+            await r.aclose()
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+# ── Serve Frontend ───────────────────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(DASHBOARD_HTML)
+
+# ── Embedded Frontend ────────────────────────────────────────────────────────
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NeuralOps — SOC Dashboard</title>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-secondary: #f8f9fa;
+    --bg-card: #ffffff;
+    --bg-hover: #f1f3f5;
+    --border: #e2e5e9;
+    --border-light: #eef0f2;
+    --text-primary: #1a1a2e;
+    --text-secondary: #5a6170;
+    --text-tertiary: #8b92a0;
+    --orange: #ff6600;
+    --orange-light: #fff3eb;
+    --orange-border: rgba(255,102,0,0.2);
+    --critical: #e53e3e;
+    --critical-bg: #fff5f5;
+    --high: #dd6b20;
+    --high-bg: #fffaf0;
+    --medium: #d69e2e;
+    --medium-bg: #fffff0;
+    --low: #38a169;
+    --low-bg: #f0fff4;
+    --info: #3182ce;
+    --info-bg: #ebf8ff;
+    --purple: #805ad5;
+    --purple-bg: #faf5ff;
+    font-family: 'Inter', system-ui, sans-serif;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-md: 0 2px 8px rgba(0,0,0,0.06);
+    --shadow-lg: 0 4px 16px rgba(0,0,0,0.08);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: var(--bg); color: var(--text-primary); overflow-x: hidden; min-height: 100vh; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #d0d5dd; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #b0b5bd; }
+  ::selection { background: var(--orange); color: #fff; }
+
+  a { color: var(--orange); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  /* Top Bar */
+  .topbar { display: flex; align-items: center; justify-content: space-between; padding: 0 24px; height: 52px; background: #fff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 100; }
+  .logo { display: flex; align-items: center; gap: 10px; }
+  .logo-icon { width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; color: var(--orange); }
+  .logo-icon svg { width: 22px; height: 22px; }
+  .logo-text { font-family: 'Fira Code', monospace; font-size: 15px; font-weight: 700; color: var(--text-primary); }
+  .logo-text span { color: var(--orange); }
+  .logo-sub { font-size: 9px; color: var(--text-tertiary); letter-spacing: 0.08em; text-transform: uppercase; font-family: 'Fira Code', monospace; }
+  .topbar-right { display: flex; align-items: center; gap: 20px; }
+  .status-indicator { display: flex; align-items: center; gap: 6px; padding: 3px 10px 3px 8px; border-radius: 3px; background: #f0fff4; border: 1px solid #c6f6d5; }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #38a169; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .status-dot.live { animation: pulse 2s infinite; }
+  .status-dot.warning { background: var(--high); }
+  .status-text { font-size: 9px; font-family: 'Fira Code', monospace; color: #38a169; font-weight: 600; letter-spacing: 0.03em; }
+  .clock { font-size: 12px; color: var(--text-tertiary); font-family: 'Fira Code', monospace; font-weight: 500; }
+
+  /* Stats Bar */
+  .stats-bar { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; background: var(--border); border-bottom: 1px solid var(--border); }
+  .stat-card { background: #fff; padding: 14px 20px; position: relative; }
+  .stat-card:hover { background: var(--bg-secondary); }
+  .stat-header { display: flex; align-items: center; justify-content: space-between; }
+  .stat-icon { display: flex; align-items: center; gap: 8px; color: var(--text-tertiary); }
+  .stat-icon svg { width: 16px; height: 16px; }
+  .stat-value { font-size: 24px; font-weight: 700; letter-spacing: -0.03em; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .stat-value.total { color: var(--text-primary); }
+  .stat-value.critical { color: var(--critical); }
+  .stat-value.high { color: var(--high); }
+  .stat-value.medium { color: var(--medium); }
+  .stat-value.purple { color: var(--purple); }
+  .stat-label { font-size: 9px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.06em; font-family: 'Fira Code', monospace; margin-top: 2px; }
+
+  /* Main Layout */
+  .main { display: flex; height: calc(100vh - 128px); }
+  .alerts-panel { flex: 1; border-right: 1px solid var(--border); overflow-y: auto; min-width: 0; background: #fff; }
+  .detail-panel { width: 440px; overflow-y: auto; flex-shrink: 0; background: var(--bg-secondary); }
+
+  /* Panel Headers */
+  .panel-header { padding: 10px 16px; background: #fff; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10; display: flex; align-items: center; justify-content: space-between; }
+  .panel-title { font-family: 'Fira Code', monospace; font-size: 10px; color: var(--text-secondary); letter-spacing: 0.04em; text-transform: uppercase; display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .panel-title .dot { width: 6px; height: 6px; border-radius: 1px; background: var(--orange); }
+  .panel-count { font-family: 'Fira Code', monospace; font-size: 10px; color: var(--text-tertiary); background: var(--bg-secondary); padding: 2px 8px; border-radius: 3px; font-weight: 500; }
+
+  /* Filter Bar */
+  .filter-bar { display: flex; gap: 4px; padding: 8px 16px; background: #fff; border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
+  .filter-btn { font-family: 'Inter', sans-serif; font-size: 11px; padding: 4px 12px; border: 1px solid var(--border); border-radius: 3px; background: #fff; color: var(--text-secondary); cursor: pointer; transition: all 0.12s; font-weight: 500; }
+  .filter-btn:hover { border-color: var(--orange); color: var(--orange); }
+  .filter-btn.active { background: var(--orange); border-color: var(--orange); color: #fff; }
+  .filter-divider { width: 1px; height: 20px; background: var(--border); margin: 0 4px; flex-shrink: 0; }
+
+  /* Alert Card */
+  .alert-card { padding: 12px 16px; border-bottom: 1px solid var(--border-light); cursor: pointer; transition: background 0.12s; position: relative; border-left: 3px solid transparent; }
+  .alert-card:hover { background: var(--bg-hover); }
+  .alert-card.active { background: var(--bg-hover); border-left-color: var(--orange); }
+  .alert-card.critical { border-left-color: var(--critical); }
+  .alert-card.high { border-left-color: var(--high); }
+  .alert-card.medium { border-left-color: var(--medium); }
+  .alert-card.low { border-left-color: var(--low); }
+
+  .source-badge { font-size: 9px; font-family: 'Fira Code', monospace; padding: 2px 6px; border-radius: 2px; letter-spacing: 0.03em; text-transform: uppercase; white-space: nowrap; font-weight: 600; }
+  .source-web { background: var(--info-bg); color: var(--info); border: 1px solid #bee3f8; }
+  .source-network { background: var(--purple-bg); color: var(--purple); border: 1px solid #e9d8fd; }
+  .source-system { background: var(--high-bg); color: var(--high); border: 1px solid #feebc8; }
+
+  .alert-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .alert-rule { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .alert-severity { font-size: 9px; font-family: 'Fira Code', monospace; padding: 2px 7px; border-radius: 2px; white-space: nowrap; font-weight: 600; letter-spacing: 0.02em; }
+  .severity-critical { background: var(--critical-bg); color: var(--critical); border: 1px solid #fed7d7; }
+  .severity-high { background: var(--high-bg); color: var(--high); border: 1px solid #feebc8; }
+  .severity-medium { background: var(--medium-bg); color: var(--medium); border: 1px solid #fefcbf; }
+  .severity-low { background: var(--low-bg); color: var(--low); border: 1px solid #c6f6d5; }
+
+  .alert-body { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .alert-tag { font-size: 9px; color: var(--text-tertiary); font-family: 'Fira Code', monospace; background: var(--bg-secondary); padding: 1px 5px; border-radius: 2px; border: 1px solid var(--border-light); }
+  .tool-tag { background: var(--purple-bg); color: var(--purple); font-weight: 600; border-color: #e9d8fd; }
+  .alert-time { font-size: 9px; color: var(--text-tertiary); font-family: 'Fira Code', monospace; }
+  .alert-ip { font-size: 10px; color: var(--text-secondary); font-family: 'Fira Code', monospace; }
+  .alert-desc { font-size: 11px; color: var(--text-secondary); margin-top: 4px; line-height: 1.4; }
+  .alert-conf { font-size: 9px; color: var(--text-tertiary); font-family: 'Fira Code', monospace; }
+
+  /* Empty State */
+  .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 60px 20px; color: var(--text-tertiary); }
+  .empty-icon { width: 40px; height: 40px; margin-bottom: 12px; opacity: 0.3; }
+  .empty-text { font-size: 13px; font-weight: 500; }
+  .empty-sub { font-size: 11px; margin-top: 4px; color: var(--text-tertiary); }
+
+  /* Detail Panel */
+  .detail-content { padding: 16px; }
+  .detail-section { margin-bottom: 16px; background: #fff; border-radius: 4px; border: 1px solid var(--border); overflow: hidden; }
+  .detail-section-title { font-size: 9px; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.06em; font-family: 'Fira Code', monospace; padding: 8px 12px; background: var(--bg-secondary); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 6px; }
+  .detail-grid { padding: 8px 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 2px 16px; }
+  .detail-field { display: flex; justify-content: space-between; padding: 3px 0; font-size: 11px; }
+  .detail-label { color: var(--text-tertiary); font-size: 10px; }
+  .detail-value { color: var(--text-primary); font-weight: 500; max-width: 55%; text-align: right; word-break: break-all; font-size: 11px; }
+  .detail-value.mono { font-family: 'Fira Code', monospace; font-size: 10px; }
+
+  .matched-box { padding: 8px 12px; font-family: 'Fira Code', monospace; font-size: 10px; color: var(--text-secondary); word-break: break-all; line-height: 1.5; }
+
+  .mitre-link { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; margin: 6px 12px 8px; border-radius: 2px; font-size: 10px; font-family: 'Fira Code', monospace; background: var(--info-bg); border: 1px solid #bee3f8; color: var(--info); }
+  .mitre-link svg { width: 10px; height: 10px; }
+
+  /* Analysis Card */
+  .analysis-card { background: #fff; border: 1px solid var(--orange-border); border-radius: 4px; padding: 14px; margin-top: 4px; border-left: 3px solid var(--orange); }
+  .analysis-card .gemini-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 9px; color: var(--orange); font-family: 'Fira Code', monospace; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 10px; }
+  .analysis-card .gemini-badge svg { width: 12px; height: 12px; }
+  .analysis-summary { font-size: 13px; line-height: 1.5; color: var(--text-primary); margin-bottom: 10px; }
+  .analysis-explanation { font-size: 11px; line-height: 1.5; color: var(--text-secondary); margin-bottom: 10px; }
+  .analysis-row { display: flex; align-items: center; gap: 8px; font-size: 11px; margin-bottom: 8px; }
+  .analysis-actions { list-style: none; padding: 0; }
+  .analysis-actions li { padding: 5px 10px 5px 18px; margin-bottom: 3px; font-size: 11px; color: var(--text-secondary); background: var(--bg-secondary); border: 1px solid var(--border-light); position: relative; border-radius: 2px; }
+  .analysis-actions li::before { content: '→'; position: absolute; left: 6px; color: var(--orange); font-family: 'Fira Code', monospace; }
+
+  .waiting-box { padding: 20px; text-align: center; border: 1px dashed var(--border); border-radius: 4px; margin-top: 4px; }
+  .waiting-box-text { font-size: 10px; color: var(--text-tertiary); font-family: 'Fira Code', monospace; }
+
+  /* New alert animation */
+  @keyframes slideIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: translateX(0); } }
+  .alert-card.new { animation: slideIn 0.2s ease-out; }
+
+  @media (max-width: 1100px) { .stats-bar { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 900px) {
+    .main { flex-direction: column; height: auto; }
+    .detail-panel { width: 100%; border-top: 1px solid var(--border); max-height: 50vh; }
+    .stats-bar { grid-template-columns: repeat(2, 1fr); }
+    .detail-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<svg style="display:none" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="icon-shield" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+  <symbol id="icon-alert" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></symbol>
+  <symbol id="icon-activity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+  <symbol id="icon-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+  <symbol id="icon-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+  <symbol id="icon-globe" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+  <symbol id="icon-hash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+  <symbol id="icon-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></symbol>
+</svg>
+
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-icon"><svg><use href="#icon-bolt"/></svg></div>
+    <div>
+      <div class="logo-text">Neural<span>Ops</span></div>
+      <div class="logo-sub">SOC Dashboard</div>
+    </div>
+  </div>
+  <div class="topbar-right">
+    <div class="status-indicator">
+      <div class="status-dot live" id="statusDot"></div>
+      <span class="status-text" id="statusText">STREAMING</span>
+    </div>
+    <span class="clock" id="clock"></span>
+  </div>
+</div>
+
+<div class="stats-bar" id="statsBar">
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-icon"><svg><use href="#icon-shield"/></svg></div>
+    </div>
+    <div class="stat-value total" id="statTotal">0</div>
+    <div class="stat-label">Total Alerts</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-icon" style="color:var(--critical)"><svg><use href="#icon-alert"/></svg></div>
+    </div>
+    <div class="stat-value critical" id="statCritical">0</div>
+    <div class="stat-label">Critical</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-icon" style="color:var(--high)"><svg><use href="#icon-activity"/></svg></div>
+    </div>
+    <div class="stat-value high" id="statHigh">0</div>
+    <div class="stat-label">High</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-icon" style="color:var(--medium)"><svg><use href="#icon-hash"/></svg></div>
+    </div>
+    <div class="stat-value medium" id="statMed">0</div>
+    <div class="stat-label">Medium</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-header">
+      <div class="stat-icon" style="color:var(--purple)"><svg><use href="#icon-globe"/></svg></div>
+    </div>
+    <div class="stat-value purple" id="statAnalyzed">0</div>
+    <div class="stat-label">Analyzed</div>
+  </div>
+</div>
+
+<div class="main">
+  <div class="alerts-panel">
+    <div class="panel-header">
+      <div class="panel-title"><span class="dot"></span> Alert Feed</div>
+      <div class="panel-count" id="alertCount">0</div>
+    </div>
+    <div class="filter-bar" id="filterBar">
+      <button class="filter-btn active" data-filter="all">All</button>
+      <button class="filter-btn" data-filter="CRITICAL">Critical</button>
+      <button class="filter-btn" data-filter="HIGH">High</button>
+      <button class="filter-btn" data-filter="MEDIUM">Medium</button>
+      <button class="filter-btn" data-filter="LOW">Low</button>
+      <div class="filter-divider"></div>
+      <button class="filter-btn" data-source="web">Web</button>
+      <button class="filter-btn" data-source="network">Network</button>
+      <button class="filter-btn" data-source="system">System</button>
+      <div class="filter-divider"></div>
+      <button class="filter-btn active" id="groupToggle" onclick="toggleGroup(event)">Group</button>
+    </div>
+    <div id="alertList"></div>
+  </div>
+  <div class="detail-panel" id="detailPanel">
+    <div class="panel-header">
+      <div class="panel-title"><span class="dot" style="background:var(--purple)"></span> Analysis</div>
+    </div>
+    <div class="detail-content" id="detailContent">
+      <div class="empty-state">
+        <svg class="empty-icon"><use href="#icon-search"/></svg>
+        <div class="empty-text">Select an alert</div>
+        <div class="empty-sub">Click any alert to view details</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const SEVERITY_CLASS = { CRITICAL:'critical', HIGH:'high', MEDIUM:'medium', LOW:'low', INFO:'info' };
+let alerts = [], currentFilter = 'all', currentSource = null, selectedAlertId = null, analysisCache = {};
+let groupEnabled = true;
+const GROUP_SECS = 30;
+
+function groupKey(a) {
+  // Group alerts with same rule + source_ip + source within GROUP_SECS
+  const ts = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+  const bucket = Math.floor(ts / (GROUP_SECS * 1000));
+  return `${a.rule_name||''}|${a.source_ip||''}|${a.source||''}|${bucket}`;
+}
+
+function clock() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString('en-US', {hour12:false});
+}
+setInterval(clock, 1000); clock();
+
+async function fetchStats() {
+  try {
+    const r = await fetch('/api/stats');
+    const s = await r.json();
+    document.getElementById('statTotal').textContent = s.total_alerts;
+    document.getElementById('statCritical').textContent = s.by_severity.CRITICAL||0;
+    document.getElementById('statHigh').textContent = s.by_severity.HIGH||0;
+    document.getElementById('statMed').textContent = s.by_severity.MEDIUM||0;
+    document.getElementById('statAnalyzed').textContent = s.total_analyzed;
+  } catch(e) {}
+}
+async function fetchAlerts() {
+  try {
+    const r = await fetch('/api/alerts?limit=100');
+    const d = await r.json();
+    alerts = d.alerts; renderAlerts();
+    document.getElementById('alertCount').textContent = alerts.length;
+  } catch(e) {}
+}
+async function fetchAnalysis() {
+  try {
+    const r = await fetch('/api/analysis?limit=50');
+    const d = await r.json();
+    for (const item of d.analysis) if (item.alert_id) analysisCache[item.alert_id] = item;
+    if (selectedAlertId && analysisCache[selectedAlertId]) renderDetail(selectedAlertId);
+  } catch(e) {}
+}
+
+function renderAlerts() {
+  const container = document.getElementById('alertList');
+  let filtered = currentFilter === 'all' ? alerts : alerts.filter(a => (a.severity||'INFO').toUpperCase() === currentFilter);
+  if (currentSource) filtered = filtered.filter(a => a.source === currentSource);
+  if (!filtered.length) {
+    container.innerHTML = '<div class="empty-state"><svg class="empty-icon"><use href="#icon-search"/></svg><div class="empty-text">No alerts</div><div class="empty-sub">Waiting for incoming threats...</div></div>';
+    return;
+  }
+
+  // Group identical alerts by rule+source_ip+source+30s bucket
+  const groups = {};
+  for (const a of filtered) {
+    const key = groupKey(a);
+    if (!groups[key]) { groups[key] = { ...a, _count: 1, _ids: [a.id] }; }
+    else {
+      groups[key]._count++;
+      groups[key]._ids.push(a.id);
+      // Keep highest severity and confidence
+      const sevOrder = {CRITICAL:5,HIGH:4,MEDIUM:3,LOW:2,INFO:1};
+      if (sevOrder[(a.severity||'').toUpperCase()] > sevOrder[(groups[key].severity||'').toUpperCase()])
+        groups[key].severity = a.severity;
+      if (typeof a.confidence === 'number' && a.confidence > (groups[key].confidence||0))
+        groups[key].confidence = a.confidence;
+    }
+  }
+  const grouped = groupEnabled ? Object.values(groups) : filtered;
+
+  container.innerHTML = grouped.map(a => {
+    const sev = (a.severity||'INFO').toUpperCase(), sevClass = SEVERITY_CLASS[sev]||'info';
+    const ts = a.timestamp ? new Date(a.timestamp).toLocaleTimeString('en-US',{hour12:false}) : '--';
+    const conf = typeof a.confidence === 'number' ? a.confidence.toFixed(3) : a.confidence||'--';
+    const src = a.source||'web', srcLabel = src === 'network' ? 'NET' : src === 'system' ? 'SYS' : 'WEB';
+    const rlog = a.raw_log&&typeof a.raw_log==='object' ? a.raw_log : {};
+    const tool = rlog.tool||'';
+    const toolTag = tool ? `<span class="alert-tag tool-tag">${tool}</span>` : '';
+    const countBadge = a._count > 1 ? `<span class="alert-tag" style="background:var(--orange);color:#fff;font-weight:700;border:none;">${a._count}x</span>` : '';
+    const active = a.id === selectedAlertId ? ' active' : '';
+    const clickId = a._ids ? a._ids[0] : a.id;
+    return `<div class="alert-card ${sevClass}${active}" onclick="selectAlert('${clickId}')">
+      <div class="alert-header">
+        <div class="alert-rule">${a.rule_name||'Unknown'}${toolTag} ${countBadge}</div>
+        <div style="display:flex;gap:4px;align-items:center;">
+          <span class="source-badge source-${src}">${srcLabel}</span>
+          <div class="alert-severity severity-${sevClass}">${sev}</div>
+        </div>
+      </div>
+      <div class="alert-body">
+        <span class="alert-ip">${a.source_ip||'--'}</span>
+        <span class="alert-tag">${a.ttp||'--'}</span>
+        <span class="alert-tag">${a.kill_chain||'--'}</span>
+        <span class="alert-tag">${a.category||'--'}</span>
+        <span class="alert-conf">${conf}</span>
+        <span class="alert-time">${ts}</span>
+      </div>
+      <div class="alert-desc">${a.description||(a.rule_name?a.rule_name+' detected':'')}</div>
+    </div>`;
+  }).join('');
+}
+
+function selectAlert(id) {
+  selectedAlertId = id; renderAlerts(); renderDetail(id);
+}
+
+function renderDetail(id) {
+  const a = alerts.find(x => x.id === id), container = document.getElementById('detailContent');
+  if (!a) return;
+  const analysis = analysisCache[id], geo = a.geo&&typeof a.geo==='object'?a.geo:{};
+  const raw = a.raw_log&&typeof a.raw_log==='object'?a.raw_log:{};
+  const ts = a.timestamp ? new Date(a.timestamp).toISOString().replace('T',' ').slice(0,19) : '--';
+  const mitreLink = a.ttp ? `https://attack.mitre.org/techniques/${a.ttp}/` : '#';
+  const src = a.source || 'web';
+
+  const ctxFields = src === 'network'
+    ? [
+        ['Alert Type', raw.alert_type||'--'], ['Tool', raw.tool||'--'],
+        ['Dest IP', raw.dst_ip||'--'], ['Dest Port', raw.dst_port||'--'],
+        ['State', raw.state||'--'], ['Scan Type', raw.scan_type||'--'],
+        ['Port Count', raw.port_count||'--'], ['SYN Count', raw.syn_count||'--'],
+        ['EST Count', raw.est_count||'--'], ['Ratio', raw.ratio||'--'],
+        ['Detail', (raw.detail||'--').slice(0,40)], ['IP', raw.ip||'--'],
+        ['MAC', raw.mac||'--'], ['Prev MAC', raw.previous_mac||'--'],
+        ['Curr MAC', raw.current_mac||'--'],
+      ].filter(([_,v]) => v && v !== '--')
+    : src === 'system'
+    ? [
+        ['Message', (raw.message||'--').slice(0,60)], ['Unit', raw.unit||'--'],
+        ['Hostname', raw.hostname||'--'],
+      ].filter(([_,v]) => v && v !== '--')
+    : [
+        ['Method', raw.method||'--'], ['Path', (raw.path||'--').slice(0,50)],
+        ['Status', raw.status||'--'], ['UA', (raw.user_agent||'--').slice(0,30)],
+        ['Query', (raw.query||'--').slice(0,50)],
+        ['Body', (raw.body||'').slice(0,80)||'--'],
+      ].filter(([_,v]) => v && v !== '--');
+  let html = `
+    <div class="detail-section">
+      <div class="detail-section-title">Alert Details</div>
+      <div class="detail-grid">
+        <div class="detail-field"><span class="detail-label">Source</span><span class="detail-value">${src.charAt(0).toUpperCase()+src.slice(1)}</span></div>
+        <div class="detail-field"><span class="detail-label">Rule</span><span class="detail-value">${a.rule_name||'--'}</span></div>
+        <div class="detail-field"><span class="detail-label">Severity</span><span class="detail-value" style="color:${sevColor(a.severity)};font-weight:700">${(a.severity||'--').toUpperCase()}</span></div>
+        <div class="detail-field"><span class="detail-label">Confidence</span><span class="detail-value mono">${typeof a.confidence==='number'?(a.confidence*100).toFixed(1)+'%':'--'}</span></div>
+        <div class="detail-field"><span class="detail-label">Kill Chain</span><span class="detail-value mono">${a.kill_chain||'--'}</span></div>
+        <div class="detail-field"><span class="detail-label">Category</span><span class="detail-value">${a.category||'--'}</span></div>
+        <div class="detail-field"><span class="detail-label">Timestamp</span><span class="detail-value mono">${ts}</span></div>
+        <div class="detail-field"><span class="detail-label">Source IP</span><span class="detail-value mono">${a.source_ip||'--'}</span></div>
+      </div>
+      ${a.ttp?`<div class="mitre-link"><svg><use href="#icon-hash"/></svg><a href="${mitreLink}" target="_blank" style="color:inherit;text-decoration:none;">MITRE ATT&CK: ${a.ttp}</a></div>`:''}
+      ${raw.tool?`<div style="padding:0 12px 8px;"><span class="alert-tag tool-tag">${raw.tool}</span></div>`:''}
+    </div>
+    ${ctxFields.length?`<div class="detail-section">
+      <div class="detail-section-title">${src==='network'?'Network Context':src==='system'?'System Context':'Request Context'}</div>
+      <div class="detail-grid">${ctxFields.map(([l,v])=>`<div class="detail-field"><span class="detail-label">${l}</span><span class="detail-value mono" style="font-size:9px">${v}</span></div>`).join('')}</div>
+    </div>`:''}
+    <div class="detail-section">
+      <div class="detail-section-title">Matched Value</div>
+      <div class="matched-box">${(a.matched_value||'--').slice(0,150)}</div>
+    </div>
+    ${geo.country||geo.city?`
+    <div class="detail-section">
+      <div class="detail-section-title">Geo Location</div>
+      <div class="detail-grid">
+        <div class="detail-field"><span class="detail-label">Country</span><span class="detail-value">${geo.country||'--'}</span></div>
+        <div class="detail-field"><span class="detail-label">City</span><span class="detail-value">${geo.city||'--'}</span></div>
+        ${geo.asn?`<div class="detail-field"><span class="detail-label">ASN</span><span class="detail-value mono">${geo.asn}</span></div>`:''}
+      </div>
+    </div>`:''}`;
+
+  if (analysis && analysis.analysis) {
+    const an = analysis.analysis;
+    const fp = an.false_positive_likelihood;
+    let fpColor = '#38a169';
+    if (fp > 70) fpColor = '#e53e3e'; else if (fp > 30) fpColor = '#dd6b20';
+    html += `<div class="analysis-card">
+      <div class="gemini-badge"><svg><use href="#icon-bolt"/></svg> Gemini AI</div>
+      ${an.summary?`<div class="analysis-summary">${an.summary}</div>`:''}
+      ${an.attack_explanation?`<div class="analysis-explanation">${an.attack_explanation}</div>`:''}
+      <div class="analysis-row"><span style="font-size:9px;color:var(--text-tertiary);font-family:'Fira Code',monospace;">True Severity:</span><span style="font-weight:700;font-size:13px;color:${sevColor(an.true_severity)}">${an.true_severity||'--'}</span></div>
+      <div class="analysis-row" style="font-size:11px;color:var(--text-secondary)">False Positive Likelihood: <span style="color:${fpColor};font-weight:700;margin-left:4px">${fp!==undefined?fp+'%':'--'}</span></div>
+      ${an.recommended_actions&&an.recommended_actions.length?`
+      <div style="font-size:9px;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.05em;font-family:'Fira Code',monospace;margin-bottom:5px;">Recommended Actions</div>
+      <ul class="analysis-actions">${an.recommended_actions.map(a=>`<li>${a}</li>`).join('')}</ul>`:''}
+      ${an.analyst_notes?`<div style="margin-top:8px;padding:8px;background:var(--bg-secondary);border:1px solid var(--border-light);font-size:10px;color:var(--text-secondary);line-height:1.4;border-radius:2px;"><span style="color:var(--orange);font-family:'Fira Code',monospace;">// notes</span><br>${an.analyst_notes}</div>`:''}
+    </div>`;
+  } else {
+    html += `<div class="waiting-box"><div class="waiting-box-text">Waiting for Gemini analysis...</div></div>`;
+  }
+  container.innerHTML = html;
+}
+
+function sevColor(s) {
+  const map = {CRITICAL:'var(--critical)',HIGH:'var(--high)',MEDIUM:'var(--medium)',LOW:'var(--low)',INFO:'var(--info)'};
+  return map[(s||'').toUpperCase()] || 'var(--text-primary)';
+}
+
+function toggleGroup(e) {
+  if (e) e.stopPropagation();
+  groupEnabled = !groupEnabled;
+  document.getElementById('groupToggle').classList.toggle('active');
+  renderAlerts();
+}
+
+document.getElementById('filterBar').addEventListener('click', e => {
+  const btn = e.target.closest('.filter-btn');
+  if (!btn) return;
+  if (btn.dataset.source) {
+    currentSource = currentSource === btn.dataset.source ? null : btn.dataset.source;
+    document.querySelectorAll('.filter-btn[data-source]').forEach(b => b.classList.remove('active'));
+    if (currentSource) btn.classList.add('active');
+  } else {
+    currentSource = null;
+    document.querySelectorAll('.filter-btn[data-source]').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active'); currentFilter = btn.dataset.filter;
+  }
+  renderAlerts();
+});
+
+let source=null;
+function connectSSE() {
+  source = new EventSource('/api/stream');
+  source.onmessage = e => {
+    try {
+      const msg = JSON.parse(e.data);
+      if (msg.type === 'alert') {
+        if (alerts.findIndex(a => a.id === msg.data.id) === -1) {
+          alerts.unshift(msg.data);
+          if (alerts.length > 200) alerts.pop();
+          fetchStats(); renderAlerts();
+          document.getElementById('alertCount').textContent = alerts.length;
+        }
+      }
+    } catch(e) {}
+  };
+  source.onerror = () => {
+    document.getElementById('statusDot').className = 'status-dot warning';
+    document.getElementById('statusText').textContent = 'DISCONNECTED';
+    source.close(); setTimeout(connectSSE, 3000);
+  };
+  source.onopen = () => {
+    document.getElementById('statusDot').className = 'status-dot live';
+    document.getElementById('statusText').textContent = 'STREAMING';
+  };
+}
+
+fetchStats(); fetchAlerts(); fetchAnalysis(); connectSSE();
+setInterval(fetchAnalysis, 5000); setInterval(fetchStats, 10000);
+</script>
+</body>
+</html>"""
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  NEURALOPS — SOC Dashboard")
+    print("  http://0.0.0.0:8002")
+    print("=" * 60)
+    uvicorn.run(app, host="0.0.0.0", port=8002)
