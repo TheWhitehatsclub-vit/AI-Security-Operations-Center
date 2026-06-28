@@ -67,6 +67,7 @@ start_all() {
     start_service "Demo Web Server (8080)"  "scripts/demo_server.py"    "server.log"
     start_service "Detection Engine"        "workers/detect_engine.py"  "engine.log"
     start_service "SOC Dashboard (8002)"    "gemini/dashboard.py"       "dashboard.log"
+    start_service "Gemini Analyzer"         "gemini/worker.py"          "gemini.log"
     start_service "System Collector"        "collectors/journald.py"    "journald.log"
     start_service "Network Monitor"         "collectors/scapy.py"       "scapy.log"
 
@@ -148,6 +149,7 @@ case "${1:---all}" in
         ;;
     --engine)   check_redis; start_service "Detection Engine" "workers/detect_engine.py" "engine.log"; wait ;;
     --dashboard) check_redis; start_service "SOC Dashboard" "gemini/dashboard.py" "dashboard.log"; wait ;;
+    --gemini)   check_redis; start_service "Gemini Analyzer" "gemini/worker.py" "gemini.log"; wait ;;
     --network)  check_redis; start_service "Network Monitor" "collectors/scapy.py" "scapy.log"; wait ;;
     --system)   check_redis; start_service "System Collector" "collectors/journald.py" "journald.log"; wait ;;
     --server)   start_service "Demo Web Server" "scripts/demo_server.py" "server.log"; wait ;;

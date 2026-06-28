@@ -25,6 +25,9 @@ Thumbs.db
 data/*.mmdb
 *.log
 /tmp/
+*.bak
+*.pdf
+.pytest_cache/
 
 # Duplicate docs (keep .txt versions, ignore .odt)
 *.odt

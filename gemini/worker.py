@@ -8,8 +8,8 @@ Usage:
   python3 gemini/worker.py --api        # FastAPI server mode (UI triggers)
 """
 
-import sys, os, json, asyncio, logging
-from datetime import datetime
+import sys, os, json, asyncio, logging, time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import unquote_plus
 
@@ -28,11 +28,14 @@ GEMINI_TIMEOUT = 30
 ANALYSIS_STREAM = "neuralops:gemini_analysis"
 
 def build_prompt(alert: dict) -> str:
-    raw = alert.get("raw_log", {})
-    geo = alert.get("geo", {})
+    import json
+    raw_raw = alert.get("raw_log", {})
+    raw = json.loads(raw_raw) if isinstance(raw_raw, str) else raw_raw
+    geo_raw = alert.get("geo", {})
+    geo = json.loads(geo_raw) if isinstance(geo_raw, str) else geo_raw
     source = alert.get("source", "web")
 
-    decoded_query = unquote_plus(raw.get("query", "")) if raw.get("query") else ""
+    decoded_query = unquote_plus(raw.get("query", "")) if raw and raw.get("query") else ""
 
     # Build context section based on source type
     if source == "network":
@@ -76,8 +79,8 @@ Timestamp      : {alert.get("timestamp","")}
 Rule           : {alert.get("rule_name","")}
 Category       : {alert.get("category","")}
 Severity       : {alert.get("severity","")}
-Confidence     : {alert.get("confidence",0):.3f}
-Confidence Boost : {alert.get("confidence_boost",0)}
+    Confidence     : {float(alert.get("confidence",0)):.3f}
+    Confidence Boost : {float(alert.get("confidence_boost",0)):.3f}
 TTP            : {alert.get("ttp","")}
 Kill Chain     : {alert.get("kill_chain","")}
 
@@ -122,7 +125,7 @@ async def call_gemini(alert: dict) -> dict | None:
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024}
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4096}
     }
 
     try:
@@ -139,10 +142,13 @@ async def call_gemini(alert: dict) -> dict | None:
 
     clean = raw_text.strip()
     if clean.startswith("```"):
-        clean = clean.split("```")[1]
+        clean = clean.split("\n", 1)[-1] if "\n" in clean else clean[3:]
+        clean = clean.rsplit("```", 1)[0].strip()
         if clean.startswith("json"):
-            clean = clean[4:]
-    clean = clean.strip().rstrip("```").strip()
+            clean = clean[4:].strip()
+        elif clean.startswith("JSON"):
+            clean = clean[4:].strip()
+    clean = clean.strip()
 
     try:
         result = json.loads(clean)
@@ -152,7 +158,7 @@ async def call_gemini(alert: dict) -> dict | None:
 
     return {
         "alert_id": alert.get("id"),
-        "analyzed_at": datetime.utcnow().isoformat() + "Z",
+        "analyzed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "model_used": GEMINI_MODEL,
         "analysis": result,
         "raw_gemini": raw_text
@@ -170,6 +176,9 @@ async def consumer_loop():
 
     last_id = "0"
     r = None
+    last_api_call = 0.0
+    MIN_SECONDS_BETWEEN_CALLS = 120
+    consecutive_429s = 0
 
     try:
         r = await get_connection()
@@ -202,21 +211,37 @@ async def consumer_loop():
                     pass
 
                 alert = dict(data)
-                print(f"\n  ► New alert: {alert.get('rule_name','?')} — {alert.get('confidence',0)} [{alert.get('severity','?')}]", flush=True)
+                sev = alert.get("severity","LOW")
+                print(f"\n  ► New alert: {alert.get('rule_name','?')} — {alert.get('confidence',0)} [{sev}]", flush=True)
 
+                if sev == "LOW" and last_api_call > 0:
+                    print(f"    Skipping LOW severity — saving quota for HIGH/CRITICAL", flush=True)
+                    continue
+
+                now = time.monotonic()
+                wait = MIN_SECONDS_BETWEEN_CALLS - (now - last_api_call)
+                if wait > 0:
+                    print(f"    Rate limiting: waiting {wait:.1f}s before next API call", flush=True)
+                    await asyncio.sleep(wait)
+
+                last_api_call = time.monotonic()
                 analysis = await call_gemini(alert)
                 if analysis:
+                    consecutive_429s = 0
                     try:
                         flat = {k: json.dumps(v) if isinstance(v, (dict, list)) else str(v) for k, v in analysis.items()}
                         await r.xadd(ANALYSIS_STREAM, flat, maxlen=20000)
                     except Exception:
                         pass
-
                     result = analysis.get("analysis", {})
                     print(f"    Gemini: {result.get('summary','')[:120]}", flush=True)
                     print(f"    Severity: {result.get('true_severity','?')}  FP: {result.get('false_positive_likelihood',0)}%", flush=True)
                     print(f"    Actions: {', '.join(result.get('recommended_actions',[])[:2])}", flush=True)
                 else:
+                    consecutive_429s += 1
+                    backoff = min(2 ** consecutive_429s * 30, 600)
+                    logger.warning(f"Gemini call failed ({consecutive_429s}x) — backing off {backoff}s")
+                    await asyncio.sleep(backoff)
                     print(f"    (Gemini skipped — no key or error)", flush=True)
 
     except asyncio.CancelledError:
